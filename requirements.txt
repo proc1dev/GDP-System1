@@ -1,0 +1,9 @@
+pandas>=2.0
+requests>=2.31
+python-dateutil>=2.8
+numpy>=1.24
+
+# Bloomberg (optional — requires separate installation from Bloomberg):
+# blpapi>=3.19
+# Install via:
+#   pip install blpapi --index-url https://blp.bintray.com/pip/simple/
