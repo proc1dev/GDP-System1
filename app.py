@@ -38,9 +38,11 @@ def build_tree_table(
     data: pd.DataFrame,
     periods: list[pd.Timestamp],
     forecast_label: str,
+    forecast_overrides: dict | None = None,
 ) -> pd.DataFrame:
     rows: list[dict] = []
     last_period = periods[-1]
+    overrides = forecast_overrides or {}
 
     def _walk(node: NIPANode, depth: int, parent_sign: float):
         code = node.series.code
@@ -63,9 +65,10 @@ def build_tree_table(
         for p in periods:
             val = data.loc[p, code] if code in data.columns else None
             row[_qlabel(p)] = round(float(val), 1) if val is not None else None
-        # Forecast = last actual value
+        # Forecast: use user override if present, else last actual value
         last_val = data.loc[last_period, code] if code in data.columns else None
-        row[forecast_label] = round(float(last_val), 1) if last_val is not None else None
+        fcst_val = overrides.get(code, last_val)
+        row[forecast_label] = round(float(fcst_val), 1) if fcst_val is not None else None
         rows.append(row)
         for child, child_sign in node.children:
             _walk(child, depth + 1, child_sign)
@@ -84,6 +87,7 @@ def _add_period_highlight(fig: go.Figure, period: str | None) -> None:
 def build_level_chart(
     code: str, name: str, data: pd.DataFrame, units_label: str,
     selected_period: pd.Timestamp, forecast_label: str,
+    forecast_value: float | None = None,
     highlight_period: str | None = None,
 ) -> go.Figure:
     if code not in data.columns:
@@ -92,6 +96,7 @@ def build_level_chart(
     series = series[series.index <= selected_period]
     labels = [_qlabel(ts) for ts in series.index]
     last_val = float(series.iloc[-1])
+    fcst_val = forecast_value if forecast_value is not None else last_val
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -101,7 +106,7 @@ def build_level_chart(
         hovertemplate="%{x}: $%{y:,.1f}B<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
-        x=[labels[-1], forecast_label], y=[last_val, last_val],
+        x=[labels[-1], forecast_label], y=[last_val, fcst_val],
         mode="lines+markers", name="Forecast",
         line=dict(color="#ff7f0e", width=2, dash="dash"),
         marker=dict(size=8, symbol="diamond"),
@@ -122,6 +127,7 @@ def build_level_chart(
 def build_growth_chart(
     code: str, name: str, data: pd.DataFrame,
     selected_period: pd.Timestamp, forecast_label: str,
+    forecast_value: float | None = None,
     highlight_period: str | None = None,
 ) -> go.Figure:
     if code not in data.columns:
@@ -131,6 +137,11 @@ def build_growth_chart(
     growth = (series.pct_change() * 4 * 100).dropna()
     labels = [_qlabel(ts) for ts in growth.index]
     bar_colors = ["#d62728" if v < 0 else "#1f77b4" for v in growth.values]
+    last_val = float(series.iloc[-1])
+    if forecast_value is not None and last_val != 0:
+        fcst_growth = ((forecast_value / last_val) - 1) * 4 * 100
+    else:
+        fcst_growth = 0.0
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -138,9 +149,8 @@ def build_growth_chart(
         marker_color=bar_colors, name="Actual",
         hovertemplate="%{x}: %{y:+.2f}%<extra></extra>",
     ))
-    # Forecast growth = 0% (flat = same value)
     fig.add_trace(go.Bar(
-        x=[forecast_label], y=[0.0],
+        x=[forecast_label], y=[fcst_growth],
         marker_color="#ff7f0e", name="Forecast",
         hovertemplate="%{x}: %{y:+.2f}% (F)<extra></extra>",
     ))
@@ -201,6 +211,9 @@ if "chart_code" not in st.session_state:
     st.session_state["chart_code"] = None
     st.session_state["chart_name"] = None
     st.session_state["highlight_period"] = None
+if "forecast_overrides" not in st.session_state:
+    st.session_state["forecast_overrides"] = {}
+    st.session_state["_last_forecast_label"] = None
 
 # ── Controls (compact top bar) ───────────────────────────────────────────── #
 c1, c2, c3, _ = st.columns([2, 1, 1, 3])
@@ -227,13 +240,19 @@ period_cols = [_qlabel(p) for p in hist_periods]
 forecast_period = selected_period + pd.DateOffset(months=3)
 forecast_label = _qlabel(forecast_period) + " (F)"
 
+# Clear edits when the forecast period changes
+if st.session_state["_last_forecast_label"] != forecast_label:
+    st.session_state["forecast_overrides"] = {}
+    st.session_state["_last_forecast_label"] = forecast_label
+
 # Default chart code once data is loaded
 if st.session_state["chart_code"] is None:
     st.session_state["chart_code"] = root.series.code
     st.session_state["chart_name"] = root.series.name
 
 # ── Build tree df ────────────────────────────────────────────────────────── #
-tree_df = build_tree_table(root, data, hist_periods, forecast_label)
+tree_df = build_tree_table(root, data, hist_periods, forecast_label,
+                            st.session_state["forecast_overrides"])
 
 # ── AgGrid config ────────────────────────────────────────────────────────── #
 row_style = JsCode("""
@@ -264,7 +283,7 @@ for col in period_cols:
     gb.configure_column(col, type=["numericColumn"], valueFormatter=num_fmt, width=110)
 forecast_style = JsCode("function(p){ return { background: '#fff8e1', fontStyle: 'italic' }; }")
 gb.configure_column(forecast_label, type=["numericColumn"], valueFormatter=num_fmt,
-                    width=120, cellStyle=forecast_style)
+                    width=120, cellStyle=forecast_style, editable=True)
 gb.configure_selection("single", use_checkbox=False, suppressRowDeselection=False)
 cell_clicked_js = JsCode("""
 function(params) {
@@ -317,10 +336,17 @@ if selected is not None and len(selected) > 0:
 
 try:
     ret_df = resp.data if isinstance(resp.data, pd.DataFrame) else pd.DataFrame(resp.data)
+    # Capture any edited forecast values and persist them
+    if forecast_label in ret_df.columns and "_code" in ret_df.columns:
+        for _, row in ret_df.iterrows():
+            code_key = row.get("_code")
+            fcst_val = row.get(forecast_label)
+            if code_key and fcst_val is not None and not pd.isna(fcst_val):
+                st.session_state["forecast_overrides"][code_key] = float(fcst_val)
+    # Detect clicked column for period highlight
     clicked = ret_df[ret_df["_clicked_col"].astype(str) != ""]
     if not clicked.empty:
         col_clicked = str(clicked.iloc[0]["_clicked_col"])
-        # Quarter column clicked → highlight; Component column clicked → clear
         st.session_state["highlight_period"] = col_clicked if col_clicked in period_cols else None
 except Exception:
     pass
@@ -329,11 +355,15 @@ with col_chart:
     code = st.session_state["chart_code"]
     name = st.session_state["chart_name"]
     hp   = st.session_state["highlight_period"]
+    default_fcst = float(data.loc[selected_period, code]) if code in data.columns else None
+    fcst_val = st.session_state["forecast_overrides"].get(code, default_fcst)
     view = st.segmented_control("View", ["Level ($B)", "QoQ Growth (%)"], default="Level ($B)", label_visibility="collapsed")
     if view == "QoQ Growth (%)":
-        fig = build_growth_chart(code, name, data, selected_period, forecast_label, highlight_period=hp)
+        fig = build_growth_chart(code, name, data, selected_period, forecast_label,
+                                 forecast_value=fcst_val, highlight_period=hp)
     else:
-        fig = build_level_chart(code, name, data, units_label, selected_period, forecast_label, highlight_period=hp)
+        fig = build_level_chart(code, name, data, units_label, selected_period, forecast_label,
+                                forecast_value=fcst_val, highlight_period=hp)
     st.plotly_chart(fig, width="stretch")
 
 st.markdown("---")
