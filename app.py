@@ -1,7 +1,7 @@
 """
 GDP System — Streamlit application.
 
-Run with:  streamlit run app.py
+Run with:  python -m streamlit run app.py
 """
 import sys
 import os
@@ -13,28 +13,45 @@ import plotly.graph_objects as go
 import pandas as pd
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
-from nipa import get_table, NIPANode
-from data import MockProvider
+from db import load_table, list_tables
 
 # ── Page config ─────────────────────────────────────────────────────────── #
 st.set_page_config(page_title="GDP System", layout="wide")
 
 # ── Helpers ──────────────────────────────────────────────────────────────── #
 
-@st.cache_data(ttl=3600)
-def load_data(table_id: str, n_quarters: int = 40) -> pd.DataFrame:
-    provider = MockProvider(n_quarters=n_quarters, seed=42)
-    root = get_table(table_id)
-    codes = [n.series.code for n in root.all_nodes()]
-    return provider.fetch(codes)
-
-
 def _qlabel(ts: pd.Timestamp) -> str:
     return f"{ts.year} Q{(ts.month - 1) // 3 + 1}"
 
 
+@st.cache_data(ttl=3600)
+def get_all_tables() -> list[str]:
+    return list_tables()
+
+
+@st.cache_data(ttl=300, show_spinner="Checking Bloomberg data...")
+def fetch_table(table_name: str) -> tuple[list[dict], pd.DataFrame]:
+    """Thin cache wrapper around load_table (lazy-loads from Bloomberg if stale)."""
+    return load_table(table_name)
+
+
+def _units_label(table_name: str) -> str:
+    """Heuristic units label from table name."""
+    suffixes = table_name.split(".")
+    last = suffixes[-1] if suffixes else ""
+    if last in ("5", "1"):
+        return "Nominal $B SAAR"
+    if last == "6":
+        return "Real $B SAAR (Chained 2017)"
+    if last in ("2", "8", "9", "10", "11"):
+        return "% Change"
+    if last in ("3", "4"):
+        return "Index / Price"
+    return "Value"
+
+
 def build_tree_table(
-    root: NIPANode,
+    series: list[dict],
     data: pd.DataFrame,
     periods: list[pd.Timestamp],
     forecast_label: str,
@@ -44,36 +61,24 @@ def build_tree_table(
     last_period = periods[-1]
     overrides = forecast_overrides or {}
 
-    def _walk(node: NIPANode, depth: int, parent_sign: float):
-        code = node.series.code
-        indent = " " * (4 * depth)
-        if depth == 0:
-            prefix = ""
-        elif not node.is_leaf:
-            prefix = "= "
-        elif parent_sign < 0:
-            prefix = "- "
-        else:
-            prefix = "  "
+    for s in series:
+        ticker = s["ticker"]
+        indent = " " * (4 * s["indent_level"])
+        prefix = "= " if s["is_aggregate"] else "  "
         row: dict = {
-            "_code": code,
-            "_is_id": not node.is_leaf,
-            "_subtracted": parent_sign < 0,
+            "_ticker": ticker,
+            "_is_id": s["is_aggregate"],
             "_clicked_col": "",
-            "Component": indent + prefix + node.series.name,
+            "Component": indent + prefix + s["series_name"],
         }
         for p in periods:
-            val = data.loc[p, code] if code in data.columns else None
-            row[_qlabel(p)] = round(float(val), 1) if val is not None else None
-        # Forecast: use user override if present, else last actual value
-        last_val = data.loc[last_period, code] if code in data.columns else None
-        fcst_val = overrides.get(code, last_val)
-        row[forecast_label] = round(float(fcst_val), 1) if fcst_val is not None else None
+            val = data.loc[p, ticker] if ticker in data.columns and p in data.index else None
+            row[_qlabel(p)] = round(float(val), 1) if val is not None and not pd.isna(val) else None
+        last_val = data.loc[last_period, ticker] if ticker in data.columns and last_period in data.index else None
+        fcst_val = overrides.get(ticker, last_val)
+        row[forecast_label] = round(float(fcst_val), 1) if fcst_val is not None and not pd.isna(fcst_val) else None
         rows.append(row)
-        for child, child_sign in node.children:
-            _walk(child, depth + 1, child_sign)
 
-    _walk(root, 0, 1.0)
     return pd.DataFrame(rows)
 
 
@@ -85,14 +90,14 @@ def _add_period_highlight(fig: go.Figure, period: str | None) -> None:
 
 
 def build_level_chart(
-    code: str, name: str, data: pd.DataFrame, units_label: str,
+    ticker: str, name: str, data: pd.DataFrame, units_label: str,
     selected_period: pd.Timestamp, forecast_label: str,
     forecast_value: float | None = None,
     highlight_period: str | None = None,
 ) -> go.Figure:
-    if code not in data.columns:
+    if ticker not in data.columns:
         return go.Figure()
-    series = data[code].dropna().sort_index()
+    series = data[ticker].dropna().sort_index()
     series = series[series.index <= selected_period]
     labels = [_qlabel(ts) for ts in series.index]
     last_val = float(series.iloc[-1])
@@ -125,14 +130,14 @@ def build_level_chart(
 
 
 def build_growth_chart(
-    code: str, name: str, data: pd.DataFrame,
+    ticker: str, name: str, data: pd.DataFrame,
     selected_period: pd.Timestamp, forecast_label: str,
     forecast_value: float | None = None,
     highlight_period: str | None = None,
 ) -> go.Figure:
-    if code not in data.columns:
+    if ticker not in data.columns:
         return go.Figure()
-    series = data[code].dropna().sort_index()
+    series = data[ticker].dropna().sort_index()
     series = series[series.index <= selected_period]
     growth = (series.pct_change() * 4 * 100).dropna()
     labels = [_qlabel(ts) for ts in growth.index]
@@ -168,29 +173,33 @@ def build_growth_chart(
     return fig
 
 
-def build_treemap(root: NIPANode, data: pd.DataFrame, period: pd.Timestamp) -> go.Figure:
-    ids, labels, parents, values, colors, hover = [], [], [], [], [], []
+def build_treemap(series: list[dict], data: pd.DataFrame, period: pd.Timestamp) -> go.Figure:
+    ids, labels, parents, values, hover = [], [], [], [], []
+    stack: list[str] = []  # track parent tickers by indent depth
 
-    def _walk(node: NIPANode, parent_code: str, sign: float):
-        code = node.series.code
-        val_raw = float(data.loc[period, code]) if code in data.columns else 0.0
+    for s in series:
+        ticker = s["ticker"]
+        depth = s["indent_level"]
+        val_raw = float(data.loc[period, ticker]) if ticker in data.columns and period in data.index else 0.0
         val = abs(val_raw)
-        ids.append(code)
-        labels.append(node.series.name)
-        parents.append(parent_code)
-        values.append(val)
-        colors.append("#d62728" if sign < 0 else None)
-        hover.append(
-            f"<b>{node.series.name}</b><br>Code: {code}<br>Level: ${val_raw:,.1f}B SAAR"
-            + ("<br>(subtracted from GDP)" if sign < 0 else "")
-        )
-        for child, child_sign in node.children:
-            _walk(child, code, child_sign)
 
-    _walk(root, "", 1.0)
+        # Determine parent from stack
+        while len(stack) > depth:
+            stack.pop()
+        parent = stack[-1] if stack else ""
+
+        ids.append(ticker)
+        labels.append(s["series_name"])
+        parents.append(parent)
+        values.append(val)
+        hover.append(f"<b>{s['series_name']}</b><br>{ticker}<br>Level: ${val_raw:,.1f}B")
+
+        if s["is_aggregate"]:
+            stack.append(ticker)
+
     fig = go.Figure(go.Treemap(
         ids=ids, labels=labels, parents=parents, values=values,
-        marker=dict(colors=[c if c else "#1f77b4" for c in colors], line=dict(width=1.5, color="white")),
+        marker=dict(line=dict(width=1.5, color="white")),
         hovertemplate="%{customdata}<extra></extra>", customdata=hover,
         textinfo="label+percent parent", maxdepth=3,
     ))
@@ -198,40 +207,74 @@ def build_treemap(root: NIPANode, data: pd.DataFrame, period: pd.Timestamp) -> g
     return fig
 
 
-def build_identity_table(root: NIPANode) -> pd.DataFrame:
-    rows = []
-    for node in root.all_nodes():
-        if not node.is_leaf:
-            rows.append({"Parent": node.series.code, "Name": node.series.name, "Identity": node.identity_str()})
-    return pd.DataFrame(rows)
-
+# ── Bloomberg diagnostics (sidebar) ─────────────────────────────────────── #
+with st.sidebar:
+    st.caption("Bloomberg diagnostics")
+    if st.button("Test connection"):
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, r'C:\\claude\\GDP_System1');"
+             "from data.bloomberg import BloombergProvider;"
+             "p = BloombergProvider();"
+             "print('available:', p.available())"],
+            capture_output=True, text=True, timeout=15,
+        )
+        st.code(result.stdout or result.stderr or "(no output)")
 
 # ── Session state defaults ───────────────────────────────────────────────── #
-if "chart_code" not in st.session_state:
-    st.session_state["chart_code"] = None
+if "chart_ticker" not in st.session_state:
+    st.session_state["chart_ticker"] = None
     st.session_state["chart_name"] = None
     st.session_state["highlight_period"] = None
 if "forecast_overrides" not in st.session_state:
     st.session_state["forecast_overrides"] = {}
     st.session_state["_last_forecast_label"] = None
 
-# ── Controls (compact top bar) ───────────────────────────────────────────── #
-c1, c2, c3, _ = st.columns([2, 1, 1, 3])
-with c1:
-    table_choice = st.radio("Table", ["Nominal GDP", "Real GDP (2017 $)"],
-                            horizontal=True, label_visibility="collapsed")
-table_id = "T10105" if "Nominal" in table_choice else "T10106"
-units_label = "Nominal $B SAAR" if table_id == "T10105" else "Real $B SAAR (2017)"
+# ── Controls ─────────────────────────────────────────────────────────────── #
+all_tables = get_all_tables()
+default_idx = all_tables.index("Table 1.1.6") if "Table 1.1.6" in all_tables else 0
 
-data = load_data(table_id)
-root = get_table(table_id)
+c1, c2, c3, _ = st.columns([3, 1, 1, 2])
+with c1:
+    table_name = st.selectbox("Table", all_tables, index=default_idx, label_visibility="collapsed")
+units_label = _units_label(table_name)
+
+# Reset chart + forecast state when table changes
+if st.session_state.get("_current_table") != table_name:
+    st.session_state["chart_ticker"] = None
+    st.session_state["chart_name"] = None
+    st.session_state["forecast_overrides"] = {}
+    st.session_state["_last_forecast_label"] = None
+    st.session_state["_current_table"] = table_name
+
+import warnings as _warnings
+
+series_meta, data, load_warning = None, None, None
+with _warnings.catch_warnings(record=True) as caught:
+    _warnings.simplefilter("always")
+    try:
+        series_meta, data = fetch_table(table_name)
+    except Exception as e:
+        st.error(f"Failed to load {table_name}: {e}")
+        st.stop()
+    if caught:
+        load_warning = str(caught[-1].message)
+
+if load_warning:
+    st.warning(f"Bloomberg offline — showing cached data. ({load_warning})")
+
+if data is None or data.empty:
+    st.warning("No data in archive and Bloomberg Terminal is not running. Open Bloomberg and reload.")
+    st.stop()
+
 quarters = data.index.sort_values()
 quarter_labels = [_qlabel(q) for q in quarters]
 
 with c2:
-    n_periods = st.selectbox("Qtrs", list(range(2, 13)), index=4, label_visibility="visible")
+    n_periods = st.selectbox("Qtrs", list(range(2, 13)), index=4)
 with c3:
-    selected_label = st.selectbox("As of", quarter_labels[::-1], index=0, label_visibility="visible")
+    selected_label = st.selectbox("As of", quarter_labels[::-1], index=0)
 
 selected_period = quarters[quarter_labels.index(selected_label)]
 sel_idx = quarters.get_loc(selected_period)
@@ -240,25 +283,22 @@ period_cols = [_qlabel(p) for p in hist_periods]
 forecast_period = selected_period + pd.DateOffset(months=3)
 forecast_label = _qlabel(forecast_period) + " (F)"
 
-# Clear edits when the forecast period changes
 if st.session_state["_last_forecast_label"] != forecast_label:
     st.session_state["forecast_overrides"] = {}
     st.session_state["_last_forecast_label"] = forecast_label
 
-# Default chart code once data is loaded
-if st.session_state["chart_code"] is None:
-    st.session_state["chart_code"] = root.series.code
-    st.session_state["chart_name"] = root.series.name
+if st.session_state["chart_ticker"] is None and series_meta:
+    st.session_state["chart_ticker"] = series_meta[0]["ticker"]
+    st.session_state["chart_name"] = series_meta[0]["series_name"]
 
 # ── Build tree df ────────────────────────────────────────────────────────── #
-tree_df = build_tree_table(root, data, hist_periods, forecast_label,
-                            st.session_state["forecast_overrides"])
+tree_df = build_tree_table(series_meta, data, hist_periods, forecast_label,
+                           st.session_state["forecast_overrides"])
 
 # ── AgGrid config ────────────────────────────────────────────────────────── #
 row_style = JsCode("""
 function(params) {
-    if (params.data._is_id)      return { fontWeight: 'bold', background: '#f5f5f5' };
-    if (params.data._subtracted) return { color: '#c0392b' };
+    if (params.data._is_id) return { fontWeight: 'bold', background: '#f5f5f5' };
     return {};
 }
 """)
@@ -271,14 +311,13 @@ function(p) {
 }
 """)
 
-
 scroll_to_last = JsCode(f"""
 function(params) {{ params.api.ensureColumnVisible('{forecast_label}'); }}
 """)
 
-gb = GridOptionsBuilder.from_dataframe(tree_df[["Component"] + period_cols])
+gb = GridOptionsBuilder.from_dataframe(tree_df[["Component"] + period_cols + [forecast_label]])
 gb.configure_default_column(resizable=True, sortable=False, filter=False, suppressSizeToFit=True)
-gb.configure_column("Component", pinned="left", width=260)
+gb.configure_column("Component", pinned="left", width=280)
 for col in period_cols:
     gb.configure_column(col, type=["numericColumn"], valueFormatter=num_fmt, width=110)
 forecast_style = JsCode("function(p){ return { background: '#fff8e1', fontStyle: 'italic' }; }")
@@ -293,7 +332,6 @@ function(params) {
     }
 }
 """)
-
 gb.configure_grid_options(
     getRowStyle=row_style,
     onCellClicked=cell_clicked_js,
@@ -312,11 +350,11 @@ custom_css = {
     ".ag-root-wrapper": {"border": "none"},
 }
 
-# ── Layout: hierarchy (left) + chart (right) ─────────────────────────────── #
+# ── Layout ───────────────────────────────────────────────────────────────── #
 col_table, col_chart = st.columns([1, 1])
 
 with col_table:
-    st.caption("= identity  ·  - subtracted  ·  click a row to chart it")
+    st.caption("= aggregate  ·  click a row to chart it")
     resp = AgGrid(
         tree_df,
         gridOptions=grid_opts,
@@ -327,23 +365,20 @@ with col_table:
         custom_css=custom_css,
     )
 
-# Pick up selection and clicked column from returned data
 selected = resp.selected_rows
 if selected is not None and len(selected) > 0:
     sel_row = selected[0] if isinstance(selected, list) else selected.iloc[0]
-    st.session_state["chart_code"] = sel_row["_code"]
-    st.session_state["chart_name"] = str(sel_row["Component"]).lstrip().lstrip("=- ").strip()
+    st.session_state["chart_ticker"] = sel_row["_ticker"]
+    st.session_state["chart_name"] = str(sel_row["Component"]).lstrip(" ").lstrip("= ").strip()
 
 try:
     ret_df = resp.data if isinstance(resp.data, pd.DataFrame) else pd.DataFrame(resp.data)
-    # Capture any edited forecast values and persist them
-    if forecast_label in ret_df.columns and "_code" in ret_df.columns:
+    if forecast_label in ret_df.columns and "_ticker" in ret_df.columns:
         for _, row in ret_df.iterrows():
-            code_key = row.get("_code")
+            t = row.get("_ticker")
             fcst_val = row.get(forecast_label)
-            if code_key and fcst_val is not None and not pd.isna(fcst_val):
-                st.session_state["forecast_overrides"][code_key] = float(fcst_val)
-    # Detect clicked column for period highlight
+            if t and fcst_val is not None and not pd.isna(fcst_val):
+                st.session_state["forecast_overrides"][t] = float(fcst_val)
     clicked = ret_df[ret_df["_clicked_col"].astype(str) != ""]
     if not clicked.empty:
         col_clicked = str(clicked.iloc[0]["_clicked_col"])
@@ -352,17 +387,17 @@ except Exception:
     pass
 
 with col_chart:
-    code = st.session_state["chart_code"]
+    ticker = st.session_state["chart_ticker"]
     name = st.session_state["chart_name"]
-    hp   = st.session_state["highlight_period"]
-    default_fcst = float(data.loc[selected_period, code]) if code in data.columns else None
-    fcst_val = st.session_state["forecast_overrides"].get(code, default_fcst)
+    hp = st.session_state["highlight_period"]
+    default_fcst = float(data.loc[selected_period, ticker]) if ticker in data.columns and selected_period in data.index else None
+    fcst_val = st.session_state["forecast_overrides"].get(ticker, default_fcst)
     view = st.segmented_control("View", ["Level ($B)", "QoQ Growth (%)"], default="Level ($B)", label_visibility="collapsed")
     if view == "QoQ Growth (%)":
-        fig = build_growth_chart(code, name, data, selected_period, forecast_label,
+        fig = build_growth_chart(ticker, name, data, selected_period, forecast_label,
                                  forecast_value=fcst_val, highlight_period=hp)
     else:
-        fig = build_level_chart(code, name, data, units_label, selected_period, forecast_label,
+        fig = build_level_chart(ticker, name, data, units_label, selected_period, forecast_label,
                                 forecast_value=fcst_val, highlight_period=hp)
     st.plotly_chart(fig, width="stretch")
 
@@ -370,11 +405,5 @@ st.markdown("---")
 
 # ── Composition treemap ──────────────────────────────────────────────────── #
 st.subheader("Composition")
-st.caption(f"Box size = share of GDP  ·  red = subtracted  ·  {selected_label}")
-st.plotly_chart(build_treemap(root, data, selected_period), width="stretch")
-
-st.markdown("---")
-
-# ── Accounting identities ────────────────────────────────────────────────── #
-with st.expander("Accounting Identities", expanded=False):
-    st.dataframe(build_identity_table(root), width="stretch", hide_index=True)
+st.caption(f"Box size = share of total  ·  {selected_label}")
+st.plotly_chart(build_treemap(series_meta, data, selected_period), width="stretch")

@@ -97,12 +97,23 @@ class BloombergProvider(DataProvider):
 
     def available(self) -> bool:
         if not _BLPAPI_AVAILABLE:
+            print("[Bloomberg] blpapi not installed or import failed.")
             return False
         try:
             session = self._get_session()
             return session is not None
-        except Exception:
+        except Exception as e:
+            print(f"[Bloomberg] available() failed: {type(e).__name__}: {e}")
             return False
+
+    def close(self) -> None:
+        """Cleanly stop the Bloomberg session."""
+        if self._session is not None:
+            try:
+                self._session.stop()
+            except Exception:
+                pass
+            self._session = None
 
     def add_ticker(self, bea_code: str, bbl_ticker: str) -> None:
         """Register an additional BEA code → Bloomberg ticker mapping."""
@@ -111,6 +122,38 @@ class BloombergProvider(DataProvider):
     # ------------------------------------------------------------------ #
     # Public interface
     # ------------------------------------------------------------------ #
+
+    def fetch_by_ticker(
+        self,
+        tickers: Sequence[str],
+        field: str = "PX_LAST",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        frequency: str = "Q",
+    ) -> pd.DataFrame:
+        """Fetch historical data using Bloomberg tickers directly (no BEA mapping)."""
+        if not _BLPAPI_AVAILABLE:
+            raise RuntimeError("blpapi not installed.")
+        session = self._get_session()
+        return self._bdh(
+            tickers=list(tickers),
+            field=field,
+            start=start or "1947-01-01",
+            end=end,
+            frequency=frequency,
+            session=session,
+        )
+
+    def fetch_metadata(self, tickers: Sequence[str]) -> dict[str, dict[str, str]]:
+        """BDP call — returns reference data for series_info auto-population.
+
+        Returns {ticker: {"NAME": ..., "CRNCY": ..., ...}}
+        """
+        if not _BLPAPI_AVAILABLE:
+            raise RuntimeError("blpapi not installed.")
+        fields = ["NAME", "CRNCY", "MARKET_SECTOR_DES", "PERIODICITY_SELECTION", "UNIT_OF_MEASURE", "DATA_SOURCE"]
+        session = self._get_session()
+        return self._bdp(list(tickers), fields, session)
 
     def fetch(
         self,
@@ -230,3 +273,38 @@ class BloombergProvider(DataProvider):
         wide.columns.name = None
         wide.sort_index(inplace=True)
         return wide
+
+    def _bdp(
+        self,
+        tickers: list[str],
+        fields: list[str],
+        session,
+    ) -> dict[str, dict[str, str]]:
+        """Bloomberg BDP (reference data) request."""
+        refDataService = session.getService("//blp/refdata")
+        request = refDataService.createRequest("ReferenceDataRequest")
+
+        for ticker in tickers:
+            request.getElement("securities").appendValue(ticker)
+        for field in fields:
+            request.getElement("fields").appendValue(field)
+
+        session.sendRequest(request)
+
+        result: dict[str, dict[str, str]] = {t: {} for t in tickers}
+        while True:
+            ev = session.nextEvent(500)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    sec_array = msg.getElement("securityData")
+                    for i in range(sec_array.numValues()):
+                        sec = sec_array.getValue(i)
+                        ticker = sec.getElementAsString("security")
+                        field_data = sec.getElement("fieldData")
+                        for field in fields:
+                            if field_data.hasElement(field):
+                                result[ticker][field] = field_data.getElementAsString(field)
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+
+        return result

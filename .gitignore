@@ -4,3 +4,5 @@ __pycache__/
 .env
 _patch_block.py
 *.pdf
+*.duckdb
+db/
