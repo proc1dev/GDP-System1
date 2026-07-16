@@ -6,3 +6,4 @@ _patch_block.py
 *.pdf
 *.duckdb
 db/
+*.log

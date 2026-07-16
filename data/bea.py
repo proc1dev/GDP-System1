@@ -24,6 +24,9 @@ from typing import Optional, Sequence
 
 import pandas as pd
 import requests
+import truststore
+
+truststore.inject_into_ssl()
 
 from .base import DataProvider
 
@@ -86,6 +89,7 @@ class BEAProvider(DataProvider):
         self._key = api_key or os.getenv("BEA_API_KEY", _DEFAULT_KEY)
         self._verify_ssl = verify_ssl
         self._cache: dict[tuple, pd.DataFrame] = {}
+        self._catalog: Optional[dict[str, tuple[str, str]]] = None
 
     @property
     def name(self) -> str:
@@ -147,6 +151,89 @@ class BEAProvider(DataProvider):
             result = result.loc[result.index <= pd.Timestamp(end)]
 
         return result
+
+    # ------------------------------------------------------------------ #
+    # Table catalog + line-level structure (SeriesCode/LineNumber/LineDescription)
+    # ------------------------------------------------------------------ #
+
+    def table_catalog(self) -> dict[str, tuple[str, str]]:
+        """
+        Authoritative BEA table-number -> (TableName id, full description) map,
+        e.g. "1.1.5" -> ("T10105", "Table 1.1.5. Gross Domestic Product (A) (Q)").
+
+        Built from GetParameterValues rather than a guessed padding formula --
+        some table numbers don't follow the naive "pad each segment to 2
+        digits" rule (e.g. "1.10" -> T11000, not T10100).
+        """
+        if self._catalog is not None:
+            return self._catalog
+
+        import re
+
+        params = {
+            "UserID": self._key,
+            "method": "GetParameterValues",
+            "datasetname": "NIPA",
+            "ParameterName": "TableName",
+            "ResultFormat": "JSON",
+        }
+        resp = requests.get(_BEA_ENDPOINT, params=params, timeout=30, verify=self._verify_ssl)
+        resp.raise_for_status()
+        vals = resp.json()["BEAAPI"]["Results"]["ParamValue"]
+
+        catalog: dict[str, tuple[str, str]] = {}
+        for v in vals:
+            m = re.match(r"Table ([\d.]+)\.", v["Description"])
+            if m:
+                catalog[m.group(1)] = (v["TableName"], v["Description"])
+
+        self._catalog = catalog
+        return catalog
+
+    def table_id_for_number(self, table_number: str) -> Optional[str]:
+        """Look up a BEA TableName id from a table number like '1.1.5'. None if unknown."""
+        entry = self.table_catalog().get(table_number)
+        return entry[0] if entry else None
+
+    def get_line_metadata(self, table_id: str, frequency: str = "Q") -> list[dict]:
+        """
+        Return the ordered, deduplicated line structure for a BEA table:
+        [{"line_number": int, "series_code": str, "description": str, "is_subtraction": bool}, ...]
+
+        Uses a single recent year (line structure doesn't vary by period within
+        a vintage) rather than the full history used by _fetch_table.
+        """
+        params = {
+            "UserID": self._key,
+            "method": "GetData",
+            "datasetname": "NIPA",
+            "TableName": table_id,
+            "Frequency": frequency,
+            "Year": "2023",
+            "ResultFormat": "JSON",
+        }
+        resp = requests.get(_BEA_ENDPOINT, params=params, timeout=30, verify=self._verify_ssl)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        try:
+            rows = payload["BEAAPI"]["Results"]["Data"]
+        except (KeyError, TypeError):
+            return []
+
+        seen: dict[str, dict] = {}
+        for row in rows:
+            code = row.get("SeriesCode")
+            if code and code not in seen:
+                desc = row["LineDescription"]
+                seen[code] = {
+                    "line_number": int(row["LineNumber"]),
+                    "series_code": code,
+                    "description": desc,
+                    "is_subtraction": desc.strip().lower().startswith("less:"),
+                }
+
+        return sorted(seen.values(), key=lambda r: r["line_number"])
 
     # ------------------------------------------------------------------ #
     # Internal: fetch a whole table and parse it
